@@ -1,4 +1,4 @@
-# DarkModeParallelsSync
+# ParallelsDarkModeSync
 
 Switch appearance on macOS and your Parallels Windows VMs follow, within a couple of
 seconds, without signing out of Windows.
