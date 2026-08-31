@@ -1,0 +1,232 @@
+#!/bin/bash
+# dmsync -- manage macOS -> Parallels Windows dark/light mode sync.
+
+set -uo pipefail
+
+LABEL="com.mcneel.darkmodesync"
+STATE_DIR="$HOME/.darkmode-sync"
+STATE_FILE="$STATE_DIR/state"
+WATCHER_LOG="$STATE_DIR/watcher.log"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+# Path to the guest scripts as Windows sees them, over the Parallels share.
+GUEST_INSTALL='\\Mac\Home\.darkmode-sync\guest\Install-GuestAgent.ps1'
+GUEST_UNINSTALL='\\Mac\Home\.darkmode-sync\guest\Uninstall-GuestAgent.ps1'
+GUEST_LOG='\\Mac\Home\.darkmode-sync\guest\Get-AgentLog.ps1'
+
+bold() { printf '\033[1m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+err()  { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+require_prlctl() {
+    command -v prlctl >/dev/null 2>&1 || {
+        err "prlctl not found. Is Parallels Desktop installed?"
+        exit 1
+    }
+}
+
+# Prints "uuid<TAB>status<TAB>name" for every Windows VM.
+list_windows_vms() {
+    prlctl list -a -o uuid,status,ostemplate,name 2>/dev/null | tail -n +2 |
+    while read -r uuid status ostemplate name; do
+        case "$ostemplate" in
+            win*) printf '%s\t%s\t%s\n' "$uuid" "$status" "$name" ;;
+        esac
+    done
+}
+
+# Resolves the arguments to "uuid<TAB>status<TAB>name" lines.
+# With no arguments, selects every *running* Windows VM.
+resolve_targets() {
+    if [ "$#" -eq 0 ]; then
+        list_windows_vms | awk -F'\t' '$2 == "running"'
+        return
+    fi
+
+    local arg found
+    for arg in "$@"; do
+        found=$(list_windows_vms | awk -F'\t' -v a="$arg" '$1 == a || $3 == a || $1 == "{"a"}"')
+        if [ -z "$found" ]; then
+            err "No Windows VM matches '$arg'."
+            return 1
+        fi
+        printf '%s\n' "$found"
+    done
+}
+
+host_mode() {
+    if [ -r "$STATE_FILE" ]; then
+        tr -d '[:space:]' <"$STATE_FILE"
+    else
+        printf 'unknown'
+    fi
+}
+
+watcher_running() {
+    launchctl print "gui/$UID/$LABEL" >/dev/null 2>&1
+}
+
+cmd_status() {
+    require_prlctl
+    bold "Host (macOS)"
+    local live
+    if [ "$(defaults read -g AppleInterfaceStyle 2>/dev/null)" = "Dark" ]; then live=dark; else live=light; fi
+    printf '  appearance now : %s\n' "$live"
+    printf '  published state: %s  (%s)\n' "$(host_mode)" "$STATE_FILE"
+    if watcher_running; then
+        printf '  watcher        : running\n'
+    else
+        printf '  watcher        : NOT running -- run ./install.sh\n'
+    fi
+
+    printf '\n'
+    bold "Windows VMs"
+    local any=0
+    while IFS=$'\t' read -r uuid status name; do
+        any=1
+        printf '  %-24s %-10s ' "$name" "$status"
+        if [ "$status" != "running" ]; then
+            printf 'agent unknown (VM not running)\n'
+            continue
+        fi
+        local out
+        # </dev/null: prlctl would otherwise eat the loop's stdin and skip later VMs.
+        out=$(prlctl exec "$uuid" powershell.exe -NoProfile -Command \
+            "(Get-ScheduledTask -TaskName DarkModeSync -ErrorAction SilentlyContinue).State" \
+            </dev/null 2>/dev/null | tr -d '\r\n ')
+        case "$out" in
+            Running) printf 'agent running\n' ;;
+            Ready|Disabled) printf 'agent installed but %s\n' "$out" ;;
+            "") printf 'agent NOT installed -- dmsync install-guest "%s"\n' "$name" ;;
+            *) printf 'agent state: %s\n' "$out" ;;
+        esac
+    done < <(list_windows_vms)
+    [ "$any" -eq 1 ] || printf '  (none found)\n'
+}
+
+cmd_install_guest() {
+    require_prlctl
+    local targets
+    targets=$(resolve_targets "$@") || exit 1
+    if [ -z "$targets" ]; then
+        warn "No running Windows VMs. Start one, then re-run."
+        return 1
+    fi
+
+    local rc=0
+    while IFS=$'\t' read -r uuid status name; do
+        if [ "$status" != "running" ]; then
+            warn "Skipping '$name' -- VM is $status. Start it and re-run."
+            rc=1
+            continue
+        fi
+        bold "Installing into '$name'..."
+        if prlctl exec "$uuid" powershell.exe -NoProfile -ExecutionPolicy Bypass \
+                -File "$GUEST_INSTALL" </dev/null; then
+            printf '  ok\n'
+        else
+            err "  failed for '$name'"
+            rc=1
+        fi
+    done <<<"$targets"
+    return $rc
+}
+
+cmd_uninstall_guest() {
+    require_prlctl
+    local targets
+    targets=$(resolve_targets "$@") || exit 1
+    if [ -z "$targets" ]; then
+        warn "No running Windows VMs."
+        return 1
+    fi
+
+    local rc=0
+    while IFS=$'\t' read -r uuid status name; do
+        [ "$status" = "running" ] || { warn "Skipping '$name' -- VM is $status."; rc=1; continue; }
+        bold "Removing from '$name'..."
+        prlctl exec "$uuid" powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "$GUEST_UNINSTALL" </dev/null || rc=1
+    done <<<"$targets"
+    return $rc
+}
+
+cmd_resync() {
+    require_prlctl
+    local targets
+    targets=$(resolve_targets "$@") || exit 1
+    if [ -z "$targets" ]; then
+        warn "No running Windows VMs."
+        return 1
+    fi
+
+    # Force the host to republish, then nudge each guest to apply immediately.
+    local mode
+    mode=$(host_mode)
+    [ "$mode" = "unknown" ] && { err "No host state yet. Is the watcher running?"; return 1; }
+
+    while IFS=$'\t' read -r uuid status name; do
+        [ "$status" = "running" ] || { warn "Skipping '$name' -- VM is $status."; continue; }
+        bold "Resyncing '$name' to $mode..."
+        prlctl exec "$uuid" powershell.exe -NoProfile -Command \
+            "Stop-ScheduledTask -TaskName DarkModeSync -ErrorAction SilentlyContinue; Start-ScheduledTask -TaskName DarkModeSync" \
+            </dev/null && printf '  agent restarted\n' || err "  could not restart agent on '$name'"
+    done <<<"$targets"
+}
+
+cmd_logs() {
+    if [ "$#" -eq 0 ] || [ "$1" = "host" ]; then
+        bold "Host watcher log ($WATCHER_LOG)"
+        [ -r "$WATCHER_LOG" ] && tail -n 40 "$WATCHER_LOG" || warn "(no log yet)"
+        return
+    fi
+
+    require_prlctl
+    local targets
+    targets=$(resolve_targets "$@") || exit 1
+    if [ -z "$targets" ]; then
+        warn "No running Windows VMs."
+        return 1
+    fi
+    while IFS=$'\t' read -r uuid status name; do
+        [ "$status" = "running" ] || { warn "Skipping '$name' -- VM is $status."; continue; }
+        bold "Agent log on '$name'"
+        prlctl exec "$uuid" powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "$GUEST_LOG" </dev/null 2>&1 | sed 's/^/  /'
+    done <<<"$targets"
+}
+
+cmd_vms() {
+    require_prlctl
+    bold "Windows VMs"
+    list_windows_vms | while IFS=$'\t' read -r uuid status name; do
+        printf '  %-24s %-10s %s\n' "$name" "$status" "$uuid"
+    done
+}
+
+usage() {
+    cat <<'EOF'
+dmsync -- sync macOS dark/light mode into Parallels Windows VMs
+
+Usage:
+  dmsync status                    Show host and per-VM sync state
+  dmsync vms                       List Windows VMs
+  dmsync install-guest [vm...]     Install the agent (default: all running Windows VMs)
+  dmsync uninstall-guest [vm...]   Remove the agent
+  dmsync resync [vm...]            Restart the guest agent so it re-applies now
+  dmsync logs [host|vm...]         Show the host watcher log or a guest agent log
+
+VMs may be given by name or UUID.
+EOF
+}
+
+case "${1:-status}" in
+    status)          shift 2>/dev/null; cmd_status ;;
+    vms)             shift; cmd_vms ;;
+    install-guest)   shift; cmd_install_guest "$@" ;;
+    uninstall-guest) shift; cmd_uninstall_guest "$@" ;;
+    resync)          shift; cmd_resync "$@" ;;
+    logs)            shift; cmd_logs "$@" ;;
+    -h|--help|help)  usage ;;
+    *) err "Unknown command: $1"; printf '\n'; usage; exit 1 ;;
+esac
